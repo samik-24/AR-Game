@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Gesture Shooter - Samik Nepal</title>
+    <script src="https://unpkg.com/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.158.0/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #video-container { position: absolute; width: 100%; height: 100%; transform: scaleX(-1); }
+        video { width: 100%; height: 100%; object-fit: cover; }
+        canvas { position: absolute; top: 0; left: 0; }
+        
+        #loading-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.95); display: flex; flex-direction: column;
+            justify-content: center; align-items: center; color: white; z-index: 100;
+        }
+        
+        #ui-layer {
+            position: absolute; top: 20px; left: 20px; color: #0f0; 
+            text-shadow: 2px 2px #000; pointer-events: none; font-size: 24px;
+            letter-spacing: 2px;
+        }
+
+        #footer {
+            position: absolute; bottom: 15px; width: 100%; text-align: center;
+            color: rgba(255, 255, 255, 0.7); font-size: 14px; letter-spacing: 1px;
+            text-shadow: 1px 1px 2px #000; pointer-events: none;
+        }
+
+        .vfx-text {
+            position: absolute; pointer-events: none; font-weight: bold; font-size: 30px;
+            animation: floatUp 0.8s ease-out forwards; text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        @keyframes floatUp {
+            0% { transform: translateY(0) scale(1); opacity: 1; }
+            100% { transform: translateY(-120px) scale(1.5); opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading-overlay">
+        <h2 style="letter-spacing: 5px;">SYSTEM INITIALIZING</h2>
+        <p id="status">Downloading Hand Models...</p>
+    </div>
+
+    <div id="ui-layer">SCORE: <span id="score">0</span></div>
+    
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline></video>
+    </div>
+
+    <div id="footer">Developed by <strong>Samik Nepal</strong></div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const scoreEl = document.getElementById('score');
+        const statusEl = document.getElementById('status');
+        const loadingOverlay = document.getElementById('loading-overlay');
+
+        let score = 0;
+        let lastDetectionTime = 0;
+        let isTriggerDown = false;
+        let activeTarget = null;
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0x444444, 2);
+        scene.add(light);
+
+        // Reticle/Crosshair
+        const reticleGeo = new THREE.RingGeometry(0.025, 0.035, 32);
+        const reticleMat = new THREE.MeshBasicMaterial({ color: 0xff0000, side: THREE.DoubleSide });
+        const reticle = new THREE.Mesh(reticleGeo, reticleMat);
+        scene.add(reticle);
+
+        // Laser Line
+        const laserMat = new THREE.LineBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.6 });
+        const laserPoints = [new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(0, 0, -10)];
+        const laserGeo = new THREE.BufferGeometry().setFromPoints(laserPoints);
+        const laser = new THREE.Line(laserGeo, laserMat);
+        scene.add(laser);
+
+        // --- Game Logic ---
+        const discs = [];
+        function createDisc() {
+            const geo = new THREE.CylinderGeometry(0.6, 0.6, 0.15, 32);
+            const mat = new THREE.MeshPhongMaterial({ 
+                color: 0x00f2ff, 
+                emissive: 0x004466,
+                specular: 0xffffff,
+                shininess: 100
+            });
+            const disc = new THREE.Mesh(geo, mat);
+            
+            const angle = Math.random() * Math.PI * 2;
+            const dist = 18;
+            disc.position.set(Math.cos(angle) * dist, Math.sin(angle) * dist, -25);
+            disc.rotation.x = Math.random() * Math.PI;
+            
+            // Fly towards a point slightly behind the camera
+            disc.velocity = new THREE.Vector3().subVectors(new THREE.Vector3(0,0,10), disc.position).normalize().multiplyScalar(0.12);
+            scene.add(disc);
+            discs.push(disc);
+        }
+
+        for(let i=0; i<4; i++) createDisc();
+
+        function spawnVFX(text, color, x, y) {
+            const div = document.createElement('div');
+            div.className = 'vfx-text';
+            div.style.left = x + 'px';
+            div.style.top = y + 'px';
+            div.style.color = color;
+            div.innerText = text;
+            document.body.appendChild(div);
+            setTimeout(() => div.remove(), 800);
+        }
+
+        // --- MediaPipe Implementation ---
+        const hands = new Hands({
+            locateFile: (file) => `https://unpkg.com/@mediapipe/hands@0.4.1646424915/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.75,
+            minTrackingConfidence: 0.75
+        });
+
+        hands.onResults(results => {
+            if (loadingOverlay.style.display !== 'none') {
+                loadingOverlay.style.display = 'none';
+            }
+
+            try {
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const landmarks = results.multiHandLandmarks[0];
+                    
+                    const indexTip = landmarks[8];
+                    const thumbTip = landmarks[4];
+                    const thumbBase = landmarks[3];
+
+                    // Aiming Logic
+                    const aimX = (1 - indexTip.x - 0.5) * 25; 
+                    const aimY = (0.5 - indexTip.y) * 20;
+                    
+                    const targetPos = new THREE.Vector3(aimX, aimY, -12);
+                    reticle.position.lerp(targetPos, 0.25);
+                    laser.position.copy(reticle.position);
+                    laser.lookAt(reticle.position.x, reticle.position.y, -50);
+
+                    // Trigger Logic
+                    const triggerPressed = thumbTip.y > thumbBase.y + 0.025;
+
+                    // Magnetic Snap
+                    activeTarget = null;
+                    let closestDist = Infinity;
+                    discs.forEach(d => {
+                        const dPos = d.position.clone().project(camera);
+                        const rPos = reticle.position.clone().project(camera);
+                        const screenDist = Math.hypot(dPos.x - rPos.x, dPos.y - rPos.y);
+                        
+                        if (screenDist < 0.18) { 
+                            if (screenDist < closestDist) {
+                                closestDist = screenDist;
+                                activeTarget = d;
+                            }
+                        }
+                    });
+
+                    if (activeTarget) {
+                        reticle.position.lerp(activeTarget.position, 0.3);
+                        reticle.material.color.setHex(0x00ff00);
+                        laser.material.color.setHex(0x00ff00);
+                    } else {
+                        reticle.material.color.setHex(0xff0000);
+                        laser.material.color.setHex(0xff0000);
+                    }
+
+                    if (triggerPressed && !isTriggerDown) {
+                        shoot();
+                    }
+                    isTriggerDown = triggerPressed;
+                }
+            } catch (err) { console.error(err); }
+        });
+
+        function shoot() {
+            // Audio Sfx
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain); gain.connect(audioCtx.destination);
+            osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.1);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+
+            const screenPos = new THREE.Vector3().copy(reticle.position).project(camera);
+            const x = (screenPos.x + 1) / 2 * window.innerWidth;
+            const y = -(screenPos.y - 1) / 2 * window.innerHeight;
+
+            if (activeTarget) {
+                scene.remove(activeTarget);
+                discs.splice(discs.indexOf(activeTarget), 1);
+                createDisc();
+                score += 100;
+                scoreEl.innerText = score;
+                spawnVFX("HIT!", "#0f0", x, y);
+            } else {
+                spawnVFX("MISS", "#f00", x, y);
+            }
+        }
+
+        const mpCamera = new Camera(videoElement, {
+            onFrame: async () => {
+                if (performance.now() - lastDetectionTime > 30) {
+                    await hands.send({image: videoElement});
+                    lastDetectionTime = performance.now();
+                }
+            },
+            width: 1280, height: 720
+        });
+        
+        statusEl.innerText = "Accessing Neural Link (Camera)...";
+        mpCamera.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            discs.forEach(d => {
+                d.position.add(d.velocity);
+                d.rotation.x += 0.05;
+                if (d.position.z > 5) {
+                    scene.remove(d);
+                    discs.splice(discs.indexOf(d), 1);
+                    createDisc();
+                }
+            });
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
